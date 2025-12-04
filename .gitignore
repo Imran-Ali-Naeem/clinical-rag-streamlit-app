@@ -1,0 +1,18 @@
+# Secrets
+api.txt
+.streamlit/
+secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.env
+venv/
+
+# Large data files (optional - keep them if <100MB)
+# *.pkl
+# *.npy
+# *.bin
+
+# OS
+.DS_Store
