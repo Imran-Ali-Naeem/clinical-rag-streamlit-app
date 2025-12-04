@@ -1,22 +1,30 @@
 import streamlit as st
 import os
 import time
-from typing import List, Tuple, Optional
+from typing import List, Tuple
 import traceback
 from pathlib import Path
-import numpy as np
+import sys
 
-# FAISS Components
-import faiss
-from langchain_community.vectorstores import FAISS
-from langchain_community.embeddings import HuggingFaceEmbeddings
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader, TextLoader
-from langchain.schema import Document
+# Check and install missing packages
+try:
+    from langchain_community.vectorstores import FAISS
+    from langchain_community.embeddings import HuggingFaceEmbeddings
+    from langchain.text_splitter import RecursiveCharacterTextSplitter
+    from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader, TextLoader
+    from langchain.schema import Document
+except ImportError as e:
+    st.error(f"❌ Missing required packages: {e}")
+    st.info("Please install required packages: pip install -r requirements.txt")
+    st.stop()
 
 # LLM
-from openai import OpenAI
-import openai
+try:
+    from openai import OpenAI
+    import openai
+except ImportError:
+    st.error("❌ OpenAI package not installed. Run: pip install openai")
+    st.stop()
 
 # ==================== CONFIGURATION ====================
 st.set_page_config(
@@ -28,435 +36,307 @@ st.set_page_config(
 # ==================== CACHED RESOURCES ====================
 @st.cache_resource(show_spinner="Loading embedding model...")
 def load_embedding_model():
-    """Load embedding model with fallback options"""
+    """Load embedding model"""
     try:
-        # Try faster model first to avoid hanging
+        # Use a reliable, fast model
         model = HuggingFaceEmbeddings(
-            model_name="all-MiniLM-L6-v2",  # Faster alternative
+            model_name="all-MiniLM-L6-v2",
             model_kwargs={'device': 'cpu'},
             encode_kwargs={
-                'normalize_embeddings': True,
-                'show_progress_bar': True
+                'normalize_embeddings': True
             }
         )
-        st.sidebar.success("✅ Loaded embedding model")
         return model
     except Exception as e:
         st.error(f"❌ Failed to load embedding model: {e}")
-        # Ultimate fallback
-        from sentence_transformers import SentenceTransformer
-        model = SentenceTransformer('all-MiniLM-L6-v2')
-        return model
+        return None
 
 @st.cache_resource(show_spinner="Initializing LLM client...")
 def setup_llm_client():
-    """Setup OpenAI client with validation"""
+    """Setup OpenAI client"""
     try:
-        if "openai_api_key" not in st.secrets:
-            st.error("❌ OpenAI API key not found in secrets")
-            st.info("Add your OpenAI API key to Streamlit secrets")
+        # Check for API key in multiple places
+        api_key = None
+        
+        # Try Streamlit secrets first
+        if hasattr(st, 'secrets') and 'openai_api_key' in st.secrets:
+            api_key = st.secrets['openai_api_key']
+        # Try environment variable
+        elif 'OPENAI_API_KEY' in os.environ:
+            api_key = os.environ['OPENAI_API_KEY']
+        else:
+            st.error("❌ OpenAI API key not found")
+            st.info("""
+            Add your API key to:
+            1. Streamlit Cloud: App settings → Secrets
+            2. Local: Create `.streamlit/secrets.toml` with:
+                openai_api_key = "your-key-here"
+            """)
             return None
         
-        client = OpenAI(
-            api_key=st.secrets["openai_api_key"],
-            timeout=30.0
-        )
+        client = OpenAI(api_key=api_key, timeout=30.0)
         
         # Test connection
         try:
-            test = client.chat.completions.create(
+            client.chat.completions.create(
                 model="gpt-3.5-turbo",
                 messages=[{"role": "user", "content": "test"}],
                 max_tokens=5
             )
             st.sidebar.success("✅ OpenAI API connected")
             return client
-        except openai.AuthenticationError:
-            st.error("❌ Invalid OpenAI API key")
-            return None
         except Exception as e:
-            st.warning(f"⚠️ OpenAI test had issue: {e}")
-            return client  # Still return client if test fails but auth works
+            st.error(f"❌ OpenAI API test failed: {str(e)[:100]}")
+            return client  # Still return client for now
+            
     except Exception as e:
         st.error(f"❌ LLM setup error: {e}")
         return None
 
 @st.cache_resource(show_spinner="Loading FAISS vector database...")
 def load_faiss_index(_embedding_model):
-    """Load existing FAISS index or create from documents"""
+    """Load or create FAISS index"""
     try:
-        # Check for existing FAISS index
+        if _embedding_model is None:
+            return None
+            
         index_path = Path("faiss_index")
         
-        if index_path.exists() and (index_path / "index.faiss").exists():
-            st.sidebar.info("📂 Loading existing FAISS index...")
-            vector_store = FAISS.load_local(
-                str(index_path),
-                _embedding_model,
-                allow_dangerous_deserialization=True
-            )
-            st.sidebar.success(f"✅ Loaded FAISS index with {vector_store.index.ntotal} vectors")
-            return vector_store
-        else:
-            # Create new index from sample documents or your actual documents
-            st.sidebar.warning("⚠️ No FAISS index found. Creating with sample data...")
-            
-            # Sample clinical documents - REPLACE WITH YOUR ACTUAL DOCUMENTS
-            sample_docs = [
-                Document(
-                    page_content="""MIGRAINE WITH AURA DIAGNOSTIC CRITERIA (ICHD-3):
-A. At least 2 attacks fulfilling criteria B and C
-B. One or more of the following fully reversible aura symptoms:
-   1. Visual symptoms (flickering lights, spots, lines, loss of vision)
-   2. Sensory symptoms (pins and needles, numbness)
-   3. Speech and/or language symptoms (dysphasia)
-   4. Motor symptoms (weakness)
-   5. Brainstem symptoms (vertigo, tinnitus, diplopia)
-   6. Retinal symptoms (monocular visual disturbances)
-C. At least three of the following six characteristics:
-   1. At least one aura symptom spreads gradually over ≥5 minutes
-   2. Two or more aura symptoms occur in succession
-   3. Each individual aura symptom lasts 5–60 minutes
-   4. At least one aura symptom is unilateral
-   5. At least one aura symptom is positive (visual scintillations)
-   6. The aura is accompanied, or followed within 60 minutes, by headache
-D. Not better accounted for by another ICHD-3 diagnosis.""",
-                    metadata={"source": "International Classification of Headache Disorders 3rd Edition", "type": "guideline"}
-                ),
-                Document(
-                    page_content="""ACUTE MIGRAINE TREATMENT:
-First-line treatments:
-1. NSAIDs: Ibuprofen 400-800mg, Naproxen 500-550mg, Diclofenac 50-100mg
-2. Triptans: Sumatriptan 50-100mg PO, Rizatriptan 10mg, Eletriptan 40mg
-3. Combination therapy: Sumatriptan 85mg + Naproxen 500mg
-
-Rescue medications for severe attacks:
-1. Anti-emetics: Metoclopramide 10mg IV/IM, Prochlorperazine 10mg
-2. Dihydroergotamine 1mg IM/SC
-3. Dexamethasone 10-24mg IV for status migrainosus
-
-Contraindications: Triptans contraindicated in patients with ischemic heart disease, Prinzmetal angina, uncontrolled hypertension, hemiplegic migraine.""",
-                    metadata={"source": "Neurology Clinical Guidelines", "type": "treatment"}
-                ),
-                Document(
-                    page_content="""MIGRAINE PREVENTIVE THERAPIES:
-Evidence Level A (Established efficacy):
-1. Beta-blockers: Propranolol 40-240mg/day, Timolol 10-30mg/day
-2. Antiepileptics: Topiramate 50-200mg/day, Valproate 500-1500mg/day
-3. Antidepressants: Amitriptyline 25-150mg/day, Venlafaxine 75-150mg/day
-
-Evidence Level B (Probably effective):
-1. CGRP monoclonal antibodies: Erenumab, Fremanezumab, Galcanezumab
-2. ARBs: Candesartan 16-32mg/day
-3. NSAIDs: Naproxen 500mg BID (short-term prevention)
-
-Lifestyle modifications: Regular sleep schedule, stress management, trigger identification, regular aerobic exercise, hydration, caffeine moderation.""",
-                    metadata={"source": "American Headache Society Guidelines", "type": "prevention"}
+        # Try to load existing index
+        if index_path.exists():
+            try:
+                vector_store = FAISS.load_local(
+                    str(index_path),
+                    _embedding_model,
+                    allow_dangerous_deserialization=True
                 )
-            ]
-            
-            # Create text splitter
-            text_splitter = RecursiveCharacterTextSplitter(
-                chunk_size=1000,
-                chunk_overlap=200,
-                length_function=len,
-                separators=["\n\n", "\n", ". ", " ", ""]
+                st.sidebar.success(f"✅ Loaded FAISS index with {vector_store.index.ntotal} vectors")
+                return vector_store
+            except Exception as e:
+                st.warning(f"⚠️ Could not load existing index: {e}")
+        
+        # Create new index with sample data
+        st.sidebar.info("🔄 Creating new FAISS index with sample data...")
+        
+        # Sample clinical documents
+        sample_docs = [
+            Document(
+                page_content="""MIGRAINE WITH AURA DIAGNOSTIC CRITERIA:
+A. At least 2 attacks fulfilling criteria B-D
+B. Aura consisting of visual, sensory, speech/language, motor, brainstem, or retinal symptoms
+C. At least two of: 1) aura spreads gradually ≥5 minutes, 2) multiple symptoms in succession, 
+   3) each symptom lasts 5-60 minutes, 4) at least one unilateral symptom
+D. Not better explained by another disorder""",
+                metadata={"source": "ICHD-3 Guidelines", "page": 1}
+            ),
+            Document(
+                page_content="""ACUTE MIGRAINE TREATMENTS:
+First-line: NSAIDs (ibuprofen, naproxen), triptans (sumatriptan, rizatriptan)
+Second-line: Anti-emetics (metoclopramide), ergotamines
+Avoid triptans in patients with cardiovascular disease""",
+                metadata={"source": "Treatment Guidelines", "page": 2}
+            ),
+            Document(
+                page_content="""MIGRAINE PREVENTION:
+Medications: Propranolol, topiramate, amitriptyline, CGRP antibodies
+Lifestyle: Regular sleep, stress management, trigger avoidance
+Avoid excessive caffeine and alcohol""",
+                metadata={"source": "Prevention Guidelines", "page": 3}
             )
-            
-            # Split documents
-            split_docs = text_splitter.split_documents(sample_docs)
-            
-            # Create FAISS index
-            vector_store = FAISS.from_documents(
-                documents=split_docs,
-                embedding=_embedding_model
-            )
-            
-            # Save the index locally
-            vector_store.save_local("faiss_index")
-            st.sidebar.success(f"✅ Created FAISS index with {len(split_docs)} document chunks")
-            
-            return vector_store
-            
+        ]
+        
+        # Create and save index
+        vector_store = FAISS.from_documents(sample_docs, _embedding_model)
+        vector_store.save_local("faiss_index")
+        st.sidebar.success(f"✅ Created FAISS index with {len(sample_docs)} documents")
+        
+        return vector_store
+        
     except Exception as e:
-        st.error(f"❌ FAISS loading error: {e}")
-        st.code(traceback.format_exc())
+        st.error(f"❌ FAISS error: {e}")
         return None
 
-# ==================== PROMPT TEMPLATES ====================
-def build_clinical_prompt(query: str, documents: List[Document]) -> str:
-    """Build a prompt for clinical question answering"""
+# ==================== PROMPT & GENERATION ====================
+def build_prompt(query: str, documents: List[Document]) -> str:
+    """Build LLM prompt"""
     if not documents:
-        return f"""You are a clinical assistant. No relevant documents were found for this query.
+        return f"""Question: {query}
 
-Question: {query}
-
-Please provide a general clinical answer based on your medical knowledge, but clearly state that no specific documents were found."""
-
-    # Format documents
-    docs_text = ""
-    for i, doc in enumerate(documents, 1):
-        content = doc.page_content[:800]  # Limit each doc
-        source = doc.metadata.get('source', 'Unknown source')
-        docs_text += f"\n--- Document {i} ({source}) ---\n{content}\n"
+Answer based on general medical knowledge since no specific documents were found:"""
     
-    prompt = f"""You are a clinical decision support assistant. Answer the medical question based ONLY on the provided clinical documents.
+    docs_text = "\n\n".join([
+        f"Document {i+1} (Source: {doc.metadata.get('source', 'Unknown')}):\n{doc.page_content[:500]}"
+        for i, doc in enumerate(documents)
+    ])
+    
+    prompt = f"""You are a clinical assistant. Use ONLY the following documents to answer.
 
-CLINICAL DOCUMENTS:
+DOCUMENTS:
 {docs_text}
 
 QUESTION: {query}
 
 INSTRUCTIONS:
-1. Answer based ONLY on information in the documents above
-2. Be precise and cite specific details from documents
-3. If information is incomplete, state what is known and what is missing
-4. Use professional medical terminology
-5. Format with clear sections if helpful
+1. Answer based ONLY on the documents above
+2. Be precise and clinical
+3. Cite specific details from documents
+4. If information is missing, say so
 
-CLINICAL ANSWER:"""
+ANSWER:"""
     
     return prompt
 
-# ==================== QUERY PROCESSING ====================
-def retrieve_documents(query: str, vector_store, k: int = 4) -> Tuple[List[Document], float]:
-    """Retrieve relevant documents from FAISS"""
-    start_time = time.time()
-    try:
-        if not vector_store:
-            return [], 0.0
-            
-        # Perform similarity search
-        docs = vector_store.similarity_search_with_score(
-            query=query,
-            k=k
-        )
-        
-        # Separate documents and scores
-        documents = [doc for doc, _ in docs]
-        scores = [score for _, score in docs]
-        
-        retrieval_time = time.time() - start_time
-        
-        # Debug info
-        if len(documents) > 0:
-            print(f"🔍 Retrieved {len(documents)} documents in {retrieval_time:.2f}s")
-            print(f"📊 Similarity scores: {scores}")
-        
-        return documents, retrieval_time
-        
-    except Exception as e:
-        st.error(f"❌ Retrieval error: {e}")
-        return [], time.time() - start_time
-
-def generate_clinical_answer(query: str, documents: List[Document], llm_client) -> Tuple[str, float]:
-    """Generate answer using LLM"""
-    start_time = time.time()
+def process_query(query: str, vector_store, llm_client):
+    """Process a clinical query"""
+    results = {
+        "answer": "",
+        "documents": [],
+        "retrieval_time": 0,
+        "generation_time": 0,
+        "error": None
+    }
     
     try:
-        if not llm_client:
-            return "❌ LLM client not available. Please check API configuration.", 0.0
+        # Step 1: Retrieve documents
+        retrieval_start = time.time()
         
-        # Build prompt
-        prompt = build_clinical_prompt(query, documents)
+        if vector_store:
+            documents = vector_store.similarity_search(query, k=3)
+        else:
+            documents = []
+            
+        results["retrieval_time"] = time.time() - retrieval_start
+        results["documents"] = documents
         
-        # Debug: Show prompt info
-        print(f"📝 Prompt length: {len(prompt)} characters")
-        print(f"📄 Number of documents: {len(documents)}")
+        # Step 2: Generate answer
+        generation_start = time.time()
         
-        # Call LLM
-        response = llm_client.chat.completions.create(
-            model="gpt-3.5-turbo",  # or "gpt-4" if available
-            messages=[
-                {"role": "system", "content": "You are a precise clinical assistant."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.1,
-            max_tokens=1000,
-            timeout=30.0
-        )
+        if llm_client:
+            prompt = build_prompt(query, documents)
+            
+            response = llm_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[
+                    {"role": "system", "content": "You are a helpful clinical assistant."},
+                    {"role": "user", "content": prompt}
+                ],
+                temperature=0.1,
+                max_tokens=500
+            )
+            
+            results["answer"] = response.choices[0].message.content
+        else:
+            results["answer"] = "❌ LLM client not available. Please check API configuration."
+            
+        results["generation_time"] = time.time() - generation_start
         
-        generation_time = time.time() - start_time
-        answer = response.choices[0].message.content
-        
-        print(f"✅ Answer generated in {generation_time:.2f}s")
-        return answer, generation_time
-        
-    except openai.APITimeoutError:
-        return "❌ LLM request timed out. Please try again.", time.time() - start_time
-    except openai.RateLimitError:
-        return "❌ Rate limit exceeded. Please wait and try again.", time.time() - start_time
-    except openai.APIError as e:
-        return f"❌ API error: {str(e)[:200]}", time.time() - start_time
     except Exception as e:
-        return f"❌ Generation error: {str(e)[:200]}", time.time() - start_time
+        results["error"] = str(e)
+        results["answer"] = f"❌ Error processing query: {str(e)[:200]}"
+    
+    return results
 
 # ==================== STREAMLIT UI ====================
 def main():
+    # Initialize session state
+    if "query" not in st.session_state:
+        st.session_state.query = ""
+    if "results" not in st.session_state:
+        st.session_state.results = None
+    
     # Sidebar
     with st.sidebar:
-        st.title("🏥 Clinical RAG Setup")
+        st.title("⚙️ Configuration")
         
-        # Initialize components
-        with st.spinner("Loading AI models..."):
+        # Load components
+        with st.spinner("Loading components..."):
             embedding_model = load_embedding_model()
             llm_client = setup_llm_client()
             vector_store = load_faiss_index(embedding_model)
         
         st.divider()
         
-        # Debug info
-        if st.checkbox("Show debug info", value=False):
-            if vector_store:
-                st.info(f"FAISS index size: {vector_store.index.ntotal} vectors")
-            if embedding_model:
-                st.info(f"Embedding model: {embedding_model.model_name}")
-        
-        st.divider()
-        
         # Example queries
-        st.subheader("🧪 Example Queries")
-        example_queries = [
-            "What are the diagnostic criteria for Migraine With Aura?",
-            "List acute treatments for migraine attacks",
-            "What are preventive therapies for chronic migraine?",
-            "What are contraindications for triptans?",
-            "Describe lifestyle modifications for migraine management"
+        st.subheader("🧪 Examples")
+        examples = [
+            "What are migraine diagnostic criteria?",
+            "List migraine treatments",
+            "What is migraine prevention?"
         ]
         
-        for query in example_queries:
-            if st.button(f"💬 {query[:40]}..."):
-                st.session_state.query = query
+        for example in examples:
+            if st.button(example, use_container_width=True):
+                st.session_state.query = example
+                st.rerun()
     
-    # Main content
+    # Main interface
     st.title("🏥 Clinical RAG Assistant")
-    st.markdown("### Medical Documentation Analysis using Retrieval-Augmented Generation")
+    st.markdown("Medical Documentation Analysis System")
     
-    st.divider()
-    
-    # API Key status
-    if "openai_api_key" in st.secrets:
-        st.success("✅ API key loaded from Streamlit secrets")
+    # API status
+    if llm_client:
+        st.success("✅ System ready - Enter your clinical question below")
     else:
-        st.error("❌ API key not found. Add to Streamlit secrets:")
-        st.code("""
-# In .streamlit/secrets.toml
-openai_api_key = "your-api-key-here"
-        """)
+        st.warning("⚠️ LLM not configured - Answers will be limited")
     
     st.divider()
     
     # Query input
     query = st.text_area(
-        "📝 Enter your clinical question:",
-        value=st.session_state.get("query", ""),
+        "📝 **Enter Clinical Question:**",
+        value=st.session_state.query,
         height=100,
         placeholder="e.g., What are the diagnostic criteria for Migraine With Aura?"
     )
     
-    # Process button
-    col1, col2, col3 = st.columns([1, 1, 2])
+    col1, col2 = st.columns([1, 4])
     with col1:
-        process_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
-    with col2:
-        clear_btn = st.button("🔄 Clear", use_container_width=True)
+        if st.button("🔍 Analyze", type="primary", use_container_width=True):
+            if query:
+                with st.spinner("Analyzing..."):
+                    st.session_state.results = process_query(query, vector_store, llm_client)
+                st.rerun()
     
-    if clear_btn:
-        st.session_state.clear()
-        st.rerun()
-    
-    if process_btn and query:
-        # Initialize session state for results
-        if "results" not in st.session_state:
-            st.session_state.results = {}
+    # Display results
+    if st.session_state.results:
+        results = st.session_state.results
         
-        # Create containers for results
-        retrieval_container = st.container()
-        answer_container = st.container()
-        sources_container = st.container()
-        debug_container = st.container()
+        st.divider()
+        st.subheader("🎯 Clinical Answer")
+        st.markdown(results["answer"])
         
-        with retrieval_container:
-            st.subheader("🔍 Retrieving Clinical Documents...")
-            retrieval_progress = st.progress(0)
-            
-            # Step 1: Retrieve documents
-            documents, retrieval_time = retrieve_documents(query, vector_store, k=4)
-            retrieval_progress.progress(50)
-            
-            # Display retrieval results
-            if documents:
-                st.success(f"✅ Retrieved {len(documents)} relevant documents in {retrieval_time:.2f}s")
-            else:
-                st.warning("⚠️ No relevant documents found. Generating general answer...")
+        st.divider()
+        st.subheader("📄 Source Documents")
         
-        with answer_container:
-            st.subheader("🎯 Clinical Answer")
-            answer_progress = st.progress(0)
-            
-            # Step 2: Generate answer
-            answer, generation_time = generate_clinical_answer(query, documents, llm_client)
-            answer_progress.progress(100)
-            
-            # Display answer
-            st.markdown(answer)
-        
-        with sources_container:
-            st.subheader("📄 Source Documents")
-            
-            if documents:
-                for i, doc in enumerate(documents, 1):
-                    with st.expander(f"Document {i}: {doc.metadata.get('source', 'Unknown')}"):
-                        st.markdown(doc.page_content)
-                        st.caption(f"Source: {doc.metadata.get('source', 'N/A')} | Type: {doc.metadata.get('type', 'N/A')}")
-            else:
-                st.info("No source documents available")
+        if results["documents"]:
+            for i, doc in enumerate(results["documents"], 1):
+                with st.expander(f"Document {i}: {doc.metadata.get('source', 'Source')}"):
+                    st.markdown(doc.page_content)
+                    st.caption(f"Source: {doc.metadata.get('source', 'N/A')}")
+        else:
+            st.info("No relevant documents found")
         
         # Metrics
         col1, col2, col3 = st.columns(3)
         with col1:
-            st.metric("⏱️ Retrieval Time", f"{retrieval_time:.2f}s")
+            st.metric("⏱️ Retrieval", f"{results['retrieval_time']:.2f}s")
         with col2:
-            st.metric("⏱️ Generation Time", f"{generation_time:.2f}s")
+            st.metric("⏱️ Generation", f"{results['generation_time']:.2f}s")
         with col3:
-            st.metric("⏱️ Total Time", f"{retrieval_time + generation_time:.2f}s")
+            total = results['retrieval_time'] + results['generation_time']
+            st.metric("⏱️ Total", f"{total:.2f}s")
         
-        with debug_container:
-            with st.expander("🔍 Debug Information", expanded=False):
-                st.subheader("Query Details")
-                st.code(f"Query: {query}")
-                
-                st.subheader("Retrieval Details")
-                st.code(f"Documents retrieved: {len(documents)}")
-                st.code(f"Vector store size: {vector_store.index.ntotal if vector_store else 0}")
-                
-                if documents:
-                    st.subheader("Document Similarities")
-                    # Get scores
-                    _, scores = vector_store.similarity_search_with_score(query, k=4)
-                    for i, score in enumerate(scores, 1):
-                        st.code(f"Document {i}: Similarity score = {score:.4f}")
-        
-        st.divider()
-        
-        # Medical disclaimer
-        st.warning("""
-        ⚠️ **MEDICAL DISCLAIMER**
-        - For educational and research purposes only
-        - Not for clinical diagnosis, treatment decisions, or patient care
-        - Always consult qualified healthcare professionals
-        - Patient identifiers have been removed for privacy
-        - System has limitations and may not have all relevant information
-        - Responses are based only on provided clinical documentation
-        """)
+        # Error display
+        if results["error"]:
+            st.error(f"Error: {results['error']}")
     
-    elif process_btn and not query:
-        st.error("❌ Please enter a clinical question")
+    # Footer
+    st.divider()
+    st.caption("""
+    ⚠️ **Disclaimer:** For educational purposes only. Not for clinical decision-making. 
+    Always consult healthcare professionals for medical advice.
+    """)
 
-# ==================== RUN APPLICATION ====================
+# ==================== RUN APP ====================
 if __name__ == "__main__":
-    # Initialize session state
-    if "query" not in st.session_state:
-        st.session_state.query = ""
-    
     main()
