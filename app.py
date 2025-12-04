@@ -1,478 +1,462 @@
 import streamlit as st
-import pandas as pd
-import numpy as np
-import faiss
-import google.generativeai as genai
-from sentence_transformers import SentenceTransformer
-import time
 import os
+import time
+from typing import List, Tuple, Optional
+import traceback
+from pathlib import Path
+import numpy as np
 
-# Set page config
+# FAISS Components
+import faiss
+from langchain_community.vectorstores import FAISS
+from langchain_community.embeddings import HuggingFaceEmbeddings
+from langchain.text_splitter import RecursiveCharacterTextSplitter
+from langchain_community.document_loaders import PyPDFLoader, DirectoryLoader, TextLoader
+from langchain.schema import Document
+
+# LLM
+from openai import OpenAI
+import openai
+
+# ==================== CONFIGURATION ====================
 st.set_page_config(
     page_title="Clinical RAG Assistant",
     page_icon="🏥",
-    layout="wide",
-    initial_sidebar_state="expanded"
+    layout="wide"
 )
 
-# ============================================================================
-# 1. LOAD API KEY FROM api.txt FILE
-# ============================================================================
-
-def load_api_key():
-    """Load API key from api.txt file with fallback options"""
-    api_key = None
-    
-    # Try 1: Read from api.txt file
+# ==================== CACHED RESOURCES ====================
+@st.cache_resource(show_spinner="Loading embedding model...")
+def load_embedding_model():
+    """Load embedding model with fallback options"""
     try:
-        if os.path.exists("api.txt"):
-            with open("api.txt", "r") as f:
-                api_key = f.read().strip()
-                if api_key and len(api_key) > 30:  # Basic validation
-                    st.success("✅ API key loaded from api.txt")
-                    return api_key
+        # Try faster model first to avoid hanging
+        model = HuggingFaceEmbeddings(
+            model_name="all-MiniLM-L6-v2",  # Faster alternative
+            model_kwargs={'device': 'cpu'},
+            encode_kwargs={
+                'normalize_embeddings': True,
+                'show_progress_bar': True
+            }
+        )
+        st.sidebar.success("✅ Loaded embedding model")
+        return model
     except Exception as e:
-        st.warning(f"⚠️ Could not read api.txt: {e}")
-    
-    # Try 2: Streamlit secrets (for cloud deployment)
-    if not api_key and "GEMINI_API_KEY" in st.secrets:
-        api_key = st.secrets["GEMINI_API_KEY"]
-        st.success("✅ API key loaded from Streamlit secrets")
-        return api_key
-    
-    # Try 3: Environment variable
-    if not api_key:
-        api_key = os.environ.get("GEMINI_API_KEY")
-        if api_key:
-            st.success("✅ API key loaded from environment")
-            return api_key
-    
-    # Try 4: Check for .streamlit/secrets.toml (local development)
-    if not api_key and os.path.exists(".streamlit/secrets.toml"):
+        st.error(f"❌ Failed to load embedding model: {e}")
+        # Ultimate fallback
+        from sentence_transformers import SentenceTransformer
+        model = SentenceTransformer('all-MiniLM-L6-v2')
+        return model
+
+@st.cache_resource(show_spinner="Initializing LLM client...")
+def setup_llm_client():
+    """Setup OpenAI client with validation"""
+    try:
+        if "openai_api_key" not in st.secrets:
+            st.error("❌ OpenAI API key not found in secrets")
+            st.info("Add your OpenAI API key to Streamlit secrets")
+            return None
+        
+        client = OpenAI(
+            api_key=st.secrets["openai_api_key"],
+            timeout=30.0
+        )
+        
+        # Test connection
         try:
-            import toml
-            secrets = toml.load(".streamlit/secrets.toml")
-            api_key = secrets.get("GEMINI_API_KEY")
-            if api_key:
-                st.success("✅ API key loaded from secrets.toml")
-                return api_key
-        except:
-            pass
-    
-    # No key found - show instructions
-    st.error("""
-    ❌ **API Key Not Found!**
-    
-    Please add your Gemini API key in one of these ways:
-    
-    **For Local Development:**
-    1. Create `api.txt` file in the same folder
-    2. Paste your Gemini API key in it (just the key, nothing else)
-    
-    **For Streamlit Cloud:**
-    1. Go to app settings → Secrets
-    2. Add: `GEMINI_API_KEY = "your-key-here"`
-    
-    **Temporary Testing (will show warning):**
-    """)
-    
-    # Temporary fallback for testing
-    test_key = "AIzaSyAdo-uQcG0b4YbnJZCInQetJ100Feu7OOo"  # Your key
-    st.warning(f"⚠️ Using test key: {test_key[:15]}...")
-    return test_key
-
-# Load API key
-API_KEY = load_api_key()
-
-# ============================================================================
-# 2. LOAD RAG COMPONENTS (Cached for performance)
-# ============================================================================
-
-@st.cache_resource
-def load_rag_components():
-    """Load RAG components once and cache them"""
-    
-    # Show loading status
-    status_container = st.empty()
-    status_container.info("🔍 Loading Clinical RAG System...")
-    
-    try:
-        # Load data files
-        chunks_df = pd.read_pickle("data/chunks_df.pkl")
-        embeddings = np.load("data/clinical_embeddings.npy")
-        index = faiss.read_index("data/faiss_index.bin")
-        
-        # Ensure 'text' column exists
-        if 'text' not in chunks_df.columns:
-            if 'chunk_text' in chunks_df.columns:
-                chunks_df['text'] = chunks_df['chunk_text']
-            elif 'content' in chunks_df.columns:
-                chunks_df['text'] = chunks_df['content']
-            else:
-                # Use first text-like column
-                for col in chunks_df.columns:
-                    if col not in ['chunk_id', 'metadata', 'embedding']:
-                        chunks_df['text'] = chunks_df[col]
-                        break
-        
-        # Load ClinicalBERT
-        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-        
-        # Configure Gemini
-        genai.configure(api_key=API_KEY)
-        
-        # Try multiple model names
-        model_names_to_try = [
-            "gemini-2.5-flash",      # Latest
-            "gemini-1.5-flash",      # Stable
-            "gemini-1.5-flash-latest",
-            "gemini-1.5-pro-latest",
-            "gemini-pro",            # Legacy but works everywhere
-        ]
-        
-        model = None
-        MODEL_NAME = None
-        
-        for model_name in model_names_to_try:
-            try:
-                test_model = genai.GenerativeModel(model_name)
-                test_response = test_model.generate_content("Test", request_options={"timeout": 5})
-                if test_response.text:
-                    model = test_model
-                    MODEL_NAME = model_name
-                    status_container.success(f"✅ Gemini {MODEL_NAME} connected!")
-                    break
-            except:
-                continue
-        
-        if not model:
-            status_container.warning("⚠️ Gemini not available - using retrieval only")
-        
-        components = {
-            "chunks_df": chunks_df,
-            "embeddings": embeddings,
-            "index": index,
-            "embedding_model": embedding_model,
-            "genai_model": model,
-            "model_name": MODEL_NAME
-        }
-        
-        # Clear loading message after success
-        time.sleep(0.5)
-        status_container.empty()
-        
-        return components
-        
+            test = client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": "test"}],
+                max_tokens=5
+            )
+            st.sidebar.success("✅ OpenAI API connected")
+            return client
+        except openai.AuthenticationError:
+            st.error("❌ Invalid OpenAI API key")
+            return None
+        except Exception as e:
+            st.warning(f"⚠️ OpenAI test had issue: {e}")
+            return client  # Still return client if test fails but auth works
     except Exception as e:
-        status_container.error(f"❌ Error loading RAG system: {str(e)[:200]}")
-        # Return minimal components to prevent crash
-        return {
-            "chunks_df": pd.DataFrame({'text': ['Error loading data']}),
-            "embeddings": np.random.randn(1, 768),
-            "index": None,
-            "embedding_model": None,
-            "genai_model": None,
-            "model_name": None
-        }
+        st.error(f"❌ LLM setup error: {e}")
+        return None
 
-# Load components
-components = load_rag_components()
-chunks_df = components["chunks_df"]
-index = components["index"]
-embedding_model = components["embedding_model"]
-genai_model = components["genai_model"]
-model_name = components["model_name"]
-
-# ============================================================================
-# 3. RAG FUNCTIONS
-# ============================================================================
-
-def retrieve_documents(query, top_k=3):
-    """Retrieve relevant clinical documents"""
+@st.cache_resource(show_spinner="Loading FAISS vector database...")
+def load_faiss_index(_embedding_model):
+    """Load existing FAISS index or create from documents"""
     try:
-        if embedding_model is None or index is None:
-            return []
+        # Check for existing FAISS index
+        index_path = Path("faiss_index")
         
-        # Encode and normalize query
-        query_embedding = embedding_model.encode([query]).astype('float32')
-        faiss.normalize_L2(query_embedding)
-        
-        # Search FAISS
-        distances, indices = index.search(query_embedding, k=top_k)
-        
-        results = []
-        for idx, sim in zip(indices[0], distances[0]):
-            if idx < len(chunks_df):
-                text = str(chunks_df.iloc[idx]['text'])
-                if len(text) > 500:
-                    text = text[:500] + "..."
-                
-                results.append({
-                    'text': text,
-                    'similarity': float(sim),
-                    'index': idx
-                })
-        
-        return results
-    except Exception as e:
-        st.error(f"Retrieval error: {e}")
-        return []
+        if index_path.exists() and (index_path / "index.faiss").exists():
+            st.sidebar.info("📂 Loading existing FAISS index...")
+            vector_store = FAISS.load_local(
+                str(index_path),
+                _embedding_model,
+                allow_dangerous_deserialization=True
+            )
+            st.sidebar.success(f"✅ Loaded FAISS index with {vector_store.index.ntotal} vectors")
+            return vector_store
+        else:
+            # Create new index from sample documents or your actual documents
+            st.sidebar.warning("⚠️ No FAISS index found. Creating with sample data...")
+            
+            # Sample clinical documents - REPLACE WITH YOUR ACTUAL DOCUMENTS
+            sample_docs = [
+                Document(
+                    page_content="""MIGRAINE WITH AURA DIAGNOSTIC CRITERIA (ICHD-3):
+A. At least 2 attacks fulfilling criteria B and C
+B. One or more of the following fully reversible aura symptoms:
+   1. Visual symptoms (flickering lights, spots, lines, loss of vision)
+   2. Sensory symptoms (pins and needles, numbness)
+   3. Speech and/or language symptoms (dysphasia)
+   4. Motor symptoms (weakness)
+   5. Brainstem symptoms (vertigo, tinnitus, diplopia)
+   6. Retinal symptoms (monocular visual disturbances)
+C. At least three of the following six characteristics:
+   1. At least one aura symptom spreads gradually over ≥5 minutes
+   2. Two or more aura symptoms occur in succession
+   3. Each individual aura symptom lasts 5–60 minutes
+   4. At least one aura symptom is unilateral
+   5. At least one aura symptom is positive (visual scintillations)
+   6. The aura is accompanied, or followed within 60 minutes, by headache
+D. Not better accounted for by another ICHD-3 diagnosis.""",
+                    metadata={"source": "International Classification of Headache Disorders 3rd Edition", "type": "guideline"}
+                ),
+                Document(
+                    page_content="""ACUTE MIGRAINE TREATMENT:
+First-line treatments:
+1. NSAIDs: Ibuprofen 400-800mg, Naproxen 500-550mg, Diclofenac 50-100mg
+2. Triptans: Sumatriptan 50-100mg PO, Rizatriptan 10mg, Eletriptan 40mg
+3. Combination therapy: Sumatriptan 85mg + Naproxen 500mg
 
-def generate_response(query, documents):
-    """Generate answer using Gemini"""
+Rescue medications for severe attacks:
+1. Anti-emetics: Metoclopramide 10mg IV/IM, Prochlorperazine 10mg
+2. Dihydroergotamine 1mg IM/SC
+3. Dexamethasone 10-24mg IV for status migrainosus
+
+Contraindications: Triptans contraindicated in patients with ischemic heart disease, Prinzmetal angina, uncontrolled hypertension, hemiplegic migraine.""",
+                    metadata={"source": "Neurology Clinical Guidelines", "type": "treatment"}
+                ),
+                Document(
+                    page_content="""MIGRAINE PREVENTIVE THERAPIES:
+Evidence Level A (Established efficacy):
+1. Beta-blockers: Propranolol 40-240mg/day, Timolol 10-30mg/day
+2. Antiepileptics: Topiramate 50-200mg/day, Valproate 500-1500mg/day
+3. Antidepressants: Amitriptyline 25-150mg/day, Venlafaxine 75-150mg/day
+
+Evidence Level B (Probably effective):
+1. CGRP monoclonal antibodies: Erenumab, Fremanezumab, Galcanezumab
+2. ARBs: Candesartan 16-32mg/day
+3. NSAIDs: Naproxen 500mg BID (short-term prevention)
+
+Lifestyle modifications: Regular sleep schedule, stress management, trigger identification, regular aerobic exercise, hydration, caffeine moderation.""",
+                    metadata={"source": "American Headache Society Guidelines", "type": "prevention"}
+                )
+            ]
+            
+            # Create text splitter
+            text_splitter = RecursiveCharacterTextSplitter(
+                chunk_size=1000,
+                chunk_overlap=200,
+                length_function=len,
+                separators=["\n\n", "\n", ". ", " ", ""]
+            )
+            
+            # Split documents
+            split_docs = text_splitter.split_documents(sample_docs)
+            
+            # Create FAISS index
+            vector_store = FAISS.from_documents(
+                documents=split_docs,
+                embedding=_embedding_model
+            )
+            
+            # Save the index locally
+            vector_store.save_local("faiss_index")
+            st.sidebar.success(f"✅ Created FAISS index with {len(split_docs)} document chunks")
+            
+            return vector_store
+            
+    except Exception as e:
+        st.error(f"❌ FAISS loading error: {e}")
+        st.code(traceback.format_exc())
+        return None
+
+# ==================== PROMPT TEMPLATES ====================
+def build_clinical_prompt(query: str, documents: List[Document]) -> str:
+    """Build a prompt for clinical question answering"""
     if not documents:
-        return "No relevant clinical documents found."
-    
-    if not genai_model:
-        return "⚠️ Gemini API not available. Showing retrieved documents only.\n\nPlease check your API key in api.txt file."
-    
-    # Build context
-    context_parts = []
+        return f"""You are a clinical assistant. No relevant documents were found for this query.
+
+Question: {query}
+
+Please provide a general clinical answer based on your medical knowledge, but clearly state that no specific documents were found."""
+
+    # Format documents
+    docs_text = ""
     for i, doc in enumerate(documents, 1):
-        context_parts.append(f"[Document {i}, Relevance: {doc['similarity']:.3f}]")
-        context_parts.append(doc['text'])
-        context_parts.append("")
+        content = doc.page_content[:800]  # Limit each doc
+        source = doc.metadata.get('source', 'Unknown source')
+        docs_text += f"\n--- Document {i} ({source}) ---\n{content}\n"
     
-    context = "\n".join(context_parts)
-    
-    # Create professional medical prompt
-    prompt = f"""You are a medical AI assistant analyzing clinical documentation.
-
-CRITICAL INSTRUCTIONS:
-1. Answer ONLY using the provided clinical notes
-2. If information is insufficient, say: "Based on the provided clinical notes, I cannot determine [specific information]"
-3. NEVER generate patient identifiers (names, IDs, exact dates)
-4. Never provide medical advice or diagnosis
-5. Always cite which document supports your answer (e.g., Document 1)
-6. Use clear, professional medical terminology
-
-FORMATTING REQUIREMENTS:
-- Use bullet points for lists
-- Use **bold** for headings/categories
-- Structure answer logically
-- Include specific citations
+    prompt = f"""You are a clinical decision support assistant. Answer the medical question based ONLY on the provided clinical documents.
 
 CLINICAL DOCUMENTS:
-{context}
+{docs_text}
 
 QUESTION: {query}
 
-STRUCTURED ANSWER BASED ONLY ON NOTES:"""
+INSTRUCTIONS:
+1. Answer based ONLY on information in the documents above
+2. Be precise and cite specific details from documents
+3. If information is incomplete, state what is known and what is missing
+4. Use professional medical terminology
+5. Format with clear sections if helpful
+
+CLINICAL ANSWER:"""
     
+    return prompt
+
+# ==================== QUERY PROCESSING ====================
+def retrieve_documents(query: str, vector_store, k: int = 4) -> Tuple[List[Document], float]:
+    """Retrieve relevant documents from FAISS"""
+    start_time = time.time()
     try:
-        generation_config = {
-            "temperature": 0.1,
-            "top_p": 0.95,
-            "top_k": 40,
-            "max_output_tokens": 2048,
-        }
-        
-        safety_settings = [
-            {"category": "HARM_CATEGORY_HARASSMENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_HATE_SPEECH", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_SEXUALLY_EXPLICIT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"},
-            {"category": "HARM_CATEGORY_DANGEROUS_CONTENT", "threshold": "BLOCK_MEDIUM_AND_ABOVE"}
-        ]
-        
-        response = genai_model.generate_content(
-            prompt,
-            generation_config=generation_config,
-            safety_settings=safety_settings
+        if not vector_store:
+            return [], 0.0
+            
+        # Perform similarity search
+        docs = vector_store.similarity_search_with_score(
+            query=query,
+            k=k
         )
-        return response.text if response.text else "No response generated."
-    except Exception as e:
-        error_msg = str(e)
-        if "429" in error_msg:
-            return "⚠️ Rate limit exceeded. Please wait a moment and try again."
-        elif "quota" in error_msg.lower():
-            return "⚠️ API quota exceeded. Please check your Gemini API billing."
-        else:
-            return f"Error: {error_msg[:100]}"
-
-# ============================================================================
-# 4. STREAMLIT UI
-# ============================================================================
-
-# Sidebar
-with st.sidebar:
-    st.title("🏥 Clinical RAG")
-    st.markdown("---")
-    
-    # API Key Status
-    st.subheader("🔑 API Status")
-    if genai_model:
-        st.success(f"✅ Gemini Connected\n*Model: {model_name}*")
-    else:
-        st.error("❌ Gemini Disabled")
-        st.info("Add API key to `api.txt` file")
-    
-    # Settings
-    st.markdown("---")
-    st.subheader("⚙️ Settings")
-    top_k = st.slider("Documents to retrieve", 1, 5, 3)
-    
-    # System info
-    st.markdown("---")
-    st.subheader("📊 System Info")
-    st.write(f"**Documents:** {len(chunks_df)}")
-    if index:
-        st.write(f"**FAISS Index:** {index.ntotal} vectors")
-    
-    # Quick queries
-    st.markdown("---")
-    st.subheader("💡 Quick Queries")
-    
-    quick_queries = {
-        "Gastric vs Duodenal Ulcers": "What are the differences between gastric ulcers and duodenal ulcers?",
-        "Medications List": "What medications are mentioned in the clinical notes?",
-        "PUD Diagnosis": "How is Peptic Ulcer Disease diagnosed according to clinical guidelines?",
-        "Migraine Criteria": "What are the diagnostic criteria for Migraine With Aura?",
-        "Patient Symptoms": "What symptoms are documented in the patient notes?",
-    }
-    
-    for name, query_text in quick_queries.items():
-        if st.button(name, use_container_width=True, key=f"btn_{name}"):
-            st.session_state.query = query_text
-            st.rerun()
-
-# Main content
-st.title("🏥 Clinical RAG Assistant")
-st.markdown("Medical Documentation Analysis using Retrieval-Augmented Generation")
-
-# API key instructions (collapsible)
-with st.expander("🔧 API Key Setup Instructions", expanded=False):
-    st.markdown("""
-    ### How to set up your Gemini API key:
-    
-    **Option 1: Local Development (api.txt file)**
-    1. Create a file named `api.txt` in the same folder as `app.py`
-    2. Paste ONLY your Gemini API key in it
-    3. No quotes, no spaces, just the key
-    
-    **Example api.txt content:**
-    ```
-    AIzaSyAdo-uQcG0b4YbnJZCInQetJ100Feu7OOo
-    ```
-    
-    **Option 2: Streamlit Cloud Deployment**
-    1. Go to your app → Settings → Secrets
-    2. Add: `GEMINI_API_KEY = "your-key-here"`
-    3. Deploy again
-    
-    **Get API key from:** [Google AI Studio](https://makersuite.google.com/app/apikey)
-    """)
-
-# Initialize session state
-if "query" not in st.session_state:
-    st.session_state.query = ""
-
-# Query input
-query = st.text_area(
-    "📝 **Enter your clinical question:**",
-    value=st.session_state.query,
-    height=100,
-    placeholder="Examples:\n• What are the differences between gastric and duodenal ulcers?\n• List the medications mentioned in the notes\n• How is Peptic Ulcer Disease diagnosed?\n• What symptoms does the patient report?"
-)
-
-col1, col2, col3 = st.columns([1, 1, 4])
-with col1:
-    analyze_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
-with col2:
-    if st.button("🗑️ Clear", use_container_width=True):
-        st.session_state.query = ""
-        st.rerun()
-
-# Process query
-if analyze_btn and query:
-    with st.spinner("🔍 Retrieving relevant documents..."):
-        start_time = time.time()
         
-        # Retrieve documents
-        documents = retrieve_documents(query, top_k=top_k)
+        # Separate documents and scores
+        documents = [doc for doc, _ in docs]
+        scores = [score for _, score in docs]
+        
         retrieval_time = time.time() - start_time
         
-        # Generate response
-        answer = generate_response(query, documents)
-        total_time = time.time() - start_time
+        # Debug info
+        if len(documents) > 0:
+            print(f"🔍 Retrieved {len(documents)} documents in {retrieval_time:.2f}s")
+            print(f"📊 Similarity scores: {scores}")
         
-        # Display results in tabs
-        tab1, tab2 = st.tabs(["🎯 Clinical Answer", "📄 Source Documents"])
+        return documents, retrieval_time
         
-        with tab1:
-            st.markdown("### Clinical Answer")
-            st.markdown(answer)
+    except Exception as e:
+        st.error(f"❌ Retrieval error: {e}")
+        return [], time.time() - start_time
+
+def generate_clinical_answer(query: str, documents: List[Document], llm_client) -> Tuple[str, float]:
+    """Generate answer using LLM"""
+    start_time = time.time()
+    
+    try:
+        if not llm_client:
+            return "❌ LLM client not available. Please check API configuration.", 0.0
+        
+        # Build prompt
+        prompt = build_clinical_prompt(query, documents)
+        
+        # Debug: Show prompt info
+        print(f"📝 Prompt length: {len(prompt)} characters")
+        print(f"📄 Number of documents: {len(documents)}")
+        
+        # Call LLM
+        response = llm_client.chat.completions.create(
+            model="gpt-3.5-turbo",  # or "gpt-4" if available
+            messages=[
+                {"role": "system", "content": "You are a precise clinical assistant."},
+                {"role": "user", "content": prompt}
+            ],
+            temperature=0.1,
+            max_tokens=1000,
+            timeout=30.0
+        )
+        
+        generation_time = time.time() - start_time
+        answer = response.choices[0].message.content
+        
+        print(f"✅ Answer generated in {generation_time:.2f}s")
+        return answer, generation_time
+        
+    except openai.APITimeoutError:
+        return "❌ LLM request timed out. Please try again.", time.time() - start_time
+    except openai.RateLimitError:
+        return "❌ Rate limit exceeded. Please wait and try again.", time.time() - start_time
+    except openai.APIError as e:
+        return f"❌ API error: {str(e)[:200]}", time.time() - start_time
+    except Exception as e:
+        return f"❌ Generation error: {str(e)[:200]}", time.time() - start_time
+
+# ==================== STREAMLIT UI ====================
+def main():
+    # Sidebar
+    with st.sidebar:
+        st.title("🏥 Clinical RAG Setup")
+        
+        # Initialize components
+        with st.spinner("Loading AI models..."):
+            embedding_model = load_embedding_model()
+            llm_client = setup_llm_client()
+            vector_store = load_faiss_index(embedding_model)
+        
+        st.divider()
+        
+        # Debug info
+        if st.checkbox("Show debug info", value=False):
+            if vector_store:
+                st.info(f"FAISS index size: {vector_store.index.ntotal} vectors")
+            if embedding_model:
+                st.info(f"Embedding model: {embedding_model.model_name}")
+        
+        st.divider()
+        
+        # Example queries
+        st.subheader("🧪 Example Queries")
+        example_queries = [
+            "What are the diagnostic criteria for Migraine With Aura?",
+            "List acute treatments for migraine attacks",
+            "What are preventive therapies for chronic migraine?",
+            "What are contraindications for triptans?",
+            "Describe lifestyle modifications for migraine management"
+        ]
+        
+        for query in example_queries:
+            if st.button(f"💬 {query[:40]}..."):
+                st.session_state.query = query
+    
+    # Main content
+    st.title("🏥 Clinical RAG Assistant")
+    st.markdown("### Medical Documentation Analysis using Retrieval-Augmented Generation")
+    
+    st.divider()
+    
+    # API Key status
+    if "openai_api_key" in st.secrets:
+        st.success("✅ API key loaded from Streamlit secrets")
+    else:
+        st.error("❌ API key not found. Add to Streamlit secrets:")
+        st.code("""
+# In .streamlit/secrets.toml
+openai_api_key = "your-api-key-here"
+        """)
+    
+    st.divider()
+    
+    # Query input
+    query = st.text_area(
+        "📝 Enter your clinical question:",
+        value=st.session_state.get("query", ""),
+        height=100,
+        placeholder="e.g., What are the diagnostic criteria for Migraine With Aura?"
+    )
+    
+    # Process button
+    col1, col2, col3 = st.columns([1, 1, 2])
+    with col1:
+        process_btn = st.button("🔍 Analyze", type="primary", use_container_width=True)
+    with col2:
+        clear_btn = st.button("🔄 Clear", use_container_width=True)
+    
+    if clear_btn:
+        st.session_state.clear()
+        st.rerun()
+    
+    if process_btn and query:
+        # Initialize session state for results
+        if "results" not in st.session_state:
+            st.session_state.results = {}
+        
+        # Create containers for results
+        retrieval_container = st.container()
+        answer_container = st.container()
+        sources_container = st.container()
+        debug_container = st.container()
+        
+        with retrieval_container:
+            st.subheader("🔍 Retrieving Clinical Documents...")
+            retrieval_progress = st.progress(0)
             
-            # Metrics
-            st.markdown("---")
-            col1, col2, col3 = st.columns(3)
-            with col1:
-                st.metric("⏱️ Retrieval Time", f"{retrieval_time:.2f}s")
-            with col2:
-                st.metric("⏱️ Total Time", f"{total_time:.2f}s")
-            with col3:
-                st.metric("📄 Documents", len(documents))
+            # Step 1: Retrieve documents
+            documents, retrieval_time = retrieve_documents(query, vector_store, k=4)
+            retrieval_progress.progress(50)
+            
+            # Display retrieval results
+            if documents:
+                st.success(f"✅ Retrieved {len(documents)} relevant documents in {retrieval_time:.2f}s")
+            else:
+                st.warning("⚠️ No relevant documents found. Generating general answer...")
         
-        with tab2:
-            st.markdown("### Retrieved Clinical Documents")
+        with answer_container:
+            st.subheader("🎯 Clinical Answer")
+            answer_progress = st.progress(0)
+            
+            # Step 2: Generate answer
+            answer, generation_time = generate_clinical_answer(query, documents, llm_client)
+            answer_progress.progress(100)
+            
+            # Display answer
+            st.markdown(answer)
+        
+        with sources_container:
+            st.subheader("📄 Source Documents")
+            
             if documents:
                 for i, doc in enumerate(documents, 1):
-                    with st.expander(f"Document {i} (Relevance: {doc['similarity']:.3f})", expanded=(i==1)):
-                        st.markdown(doc['text'])
-                        st.caption(f"Similarity score: {doc['similarity']:.3f}")
+                    with st.expander(f"Document {i}: {doc.metadata.get('source', 'Unknown')}"):
+                        st.markdown(doc.page_content)
+                        st.caption(f"Source: {doc.metadata.get('source', 'N/A')} | Type: {doc.metadata.get('type', 'N/A')}")
             else:
-                st.info("No documents retrieved with sufficient relevance.")
-
-# Example queries
-st.markdown("---")
-st.subheader("🧪 Example Clinical Queries")
-
-examples = st.columns(3)
-example_queries = [
-    ("Migraine diagnostic criteria", "What are the diagnostic criteria for Migraine With Aura?"),
-    ("GERD symptoms", "List the common symptoms of Gastro-esophageal Reflux Disease (GERD)."),
-    ("Patient symptoms", "What symptoms are documented in the patient notes?"),
-    ("Ulcer differences", "What is the difference between gastric ulcers and duodenal ulcers?"),
-    ("Medication list", "What medications are commonly mentioned in the notes?"),
-    ("Diagnosis methods", "How is Peptic Ulcer Disease diagnosed according to guidelines?"),
-]
-
-for i, (label, qtext) in enumerate(example_queries):
-    col_idx = i % 3
-    with examples[col_idx]:
-        if st.button(label, use_container_width=True, key=f"ex_{i}"):
-            st.session_state.query = qtext
-            st.rerun()
-
-# Footer
-st.markdown("---")
-st.markdown("""
-<div style='background-color: #f0f2f6; padding: 20px; border-radius: 10px; margin-top: 20px;'>
-<h4>⚠️ MEDICAL DISCLAIMER</h4>
-<ul style='color: #555;'>
-<li><strong style='color: #d32f2f;'>For educational and research purposes only</strong></li>
-<li><strong style='color: #d32f2f;'>Not for clinical diagnosis, treatment decisions, or patient care</strong></li>
-<li>Always consult qualified healthcare professionals</li>
-<li>Patient identifiers have been removed for privacy</li>
-<li>System has limitations and may not have all relevant information</li>
-<li>Responses are based only on provided clinical documentation</li>
-</ul>
-</div>
-""", unsafe_allow_html=True)
-
-# Debug info (collapsible - hidden by default)
-with st.expander("🔍 Debug Information", expanded=False):
-    st.json({
-        "api_key_loaded": bool(API_KEY) and len(API_KEY) > 30,
-        "api_key_source": "api.txt" if os.path.exists("api.txt") else ("secrets" if "GEMINI_API_KEY" in st.secrets else "environment/fallback"),
-        "documents_loaded": len(chunks_df),
-        "faiss_index_size": index.ntotal if index else "Not loaded",
-        "gemini_connected": bool(genai_model),
-        "model_name": model_name,
-        "embedding_model_loaded": embedding_model is not None
-    })
+                st.info("No source documents available")
+        
+        # Metrics
+        col1, col2, col3 = st.columns(3)
+        with col1:
+            st.metric("⏱️ Retrieval Time", f"{retrieval_time:.2f}s")
+        with col2:
+            st.metric("⏱️ Generation Time", f"{generation_time:.2f}s")
+        with col3:
+            st.metric("⏱️ Total Time", f"{retrieval_time + generation_time:.2f}s")
+        
+        with debug_container:
+            with st.expander("🔍 Debug Information", expanded=False):
+                st.subheader("Query Details")
+                st.code(f"Query: {query}")
+                
+                st.subheader("Retrieval Details")
+                st.code(f"Documents retrieved: {len(documents)}")
+                st.code(f"Vector store size: {vector_store.index.ntotal if vector_store else 0}")
+                
+                if documents:
+                    st.subheader("Document Similarities")
+                    # Get scores
+                    _, scores = vector_store.similarity_search_with_score(query, k=4)
+                    for i, score in enumerate(scores, 1):
+                        st.code(f"Document {i}: Similarity score = {score:.4f}")
+        
+        st.divider()
+        
+        # Medical disclaimer
+        st.warning("""
+        ⚠️ **MEDICAL DISCLAIMER**
+        - For educational and research purposes only
+        - Not for clinical diagnosis, treatment decisions, or patient care
+        - Always consult qualified healthcare professionals
+        - Patient identifiers have been removed for privacy
+        - System has limitations and may not have all relevant information
+        - Responses are based only on provided clinical documentation
+        """)
     
-    # Show first few chunks for verification
-    if len(chunks_df) > 0:
-        st.markdown("### Sample Document Chunks")
-        for i in range(min(3, len(chunks_df))):
-            st.text(f"Chunk {i}: {str(chunks_df.iloc[i]['text'])[:100]}...")
+    elif process_btn and not query:
+        st.error("❌ Please enter a clinical question")
+
+# ==================== RUN APPLICATION ====================
+if __name__ == "__main__":
+    # Initialize session state
+    if "query" not in st.session_state:
+        st.session_state.query = ""
+    
+    main()
