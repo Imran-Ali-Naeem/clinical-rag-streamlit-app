@@ -116,7 +116,7 @@ def load_rag_components():
                         break
         
         # Load ClinicalBERT
-        embedding_model = SentenceTransformer("emilyalsentzer/Bio_ClinicalBERT")
+        embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
         
         # Configure Gemini
         genai.configure(api_key=API_KEY)
